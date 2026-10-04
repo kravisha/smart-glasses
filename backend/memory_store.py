@@ -39,6 +39,15 @@ class MemoryStore:
         self.keep_days, self._now = keep_days, now
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _row(line: str):
+        """The row on one line, or None when the line is not a whole JSON object (a write cut short by a crash): it is skipped when reading and kept untouched when pruning."""
+        try:
+            row = json.loads(line)
+        except ValueError:
+            return None
+        return row if isinstance(row, dict) else None
+
     def _fresh(self, row: dict, cutoff: datetime) -> bool:
         try:
             return datetime.fromisoformat(str(row.get("received_at", "")).replace("Z", "+00:00")) >= cutoff
@@ -51,9 +60,11 @@ class MemoryStore:
             return
         cutoff = self._now() - timedelta(days=self.keep_days)
         lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        kept = [line for line in lines if self._fresh(json.loads(line), cutoff)]
+        kept = [line for line in lines if (self._row(line) is None) or self._fresh(self._row(line), cutoff)]      # an unreadable line is kept as it is
         if len(kept) != len(lines):
-            path.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+            temp = path.with_name(path.name + ".tmp")        # whole or absent: a crash while writing leaves the old file exactly as it was
+            temp.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+            temp.replace(path)
 
     def _path(self, user_id: str) -> Path:
         return self.root / f"{check_user_id(user_id)}.jsonl"
@@ -64,8 +75,13 @@ class MemoryStore:
         path = self._path(user_id)
         with self._lock:
             self._prune(path)
+            lead = ""
+            if path.exists() and path.stat().st_size:
+                with path.open("rb") as existing:
+                    existing.seek(-1, 2)
+                    lead = "" if existing.read(1) == b"\n" else "\n"      # a line cut short by a crash must not swallow this row
             with path.open("a", encoding="utf-8") as out:
-                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                out.write(lead + json.dumps(row, ensure_ascii=False) + "\n")
         return row
 
     def all(self, user_id: str) -> list[dict]:
@@ -74,4 +90,4 @@ class MemoryStore:
             return []
         with self._lock:
             lines = path.read_text(encoding="utf-8").splitlines()
-        return [json.loads(line) for line in lines if line.strip()]
+        return [row for row in (self._row(line) for line in lines if line.strip()) if row is not None]
