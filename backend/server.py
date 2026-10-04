@@ -13,10 +13,18 @@ One address, POST /message, JSON. Every message carries the user's ID. There are
 
 GET /health answers {"ok": true}. Anything malformed gets HTTP 400 with {"error": "..."}.
 
+Who may talk to it (Deploy's review of 93d68ffe: any web page could read and write the memories):
+  - Every POST /message carries the token in the X-Smart-Glasses-Token header, or gets 401. The token is
+    --token, or SMART_GLASSES_TOKEN, or a random one printed at start-up.
+  - A request from a web page (it has an Origin header) is refused with 403 unless that origin was named
+    with --allow-origin. A page opened from a file sends "Origin: null"; allow it only with --allow-origin null.
+  - No reply ever says Access-Control-Allow-Origin: *. An allowed origin is echoed back, nothing else is.
+  The command-line sender sends no Origin, so it needs only the token.
+
 The picture is never written to disk: it lives only in memory for the time it takes to describe it.
 
 Run it:
-    python -m backend.server                                  # fake describer, for trying the plumbing
+    python -m backend.server                                  # fake describer, for trying the plumbing (port 8830)
     python -m backend.server --describer ollama --model <vision model>     # the real thing on your PC
     add --host 0.0.0.0 to let a phone on the same wifi reach it
 """
@@ -25,7 +33,10 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hmac
 import json
+import os
+import secrets
 import sys
 import time
 from datetime import datetime
@@ -38,6 +49,13 @@ from backend.memory_store import BadUserId, MemoryStore, check_user_id
 
 MAX_BODY = 5 * 1024 * 1024          # a low-resolution frame is tens of kilobytes; 5 MB is generous
 MAX_QUESTION = 500
+DEFAULT_PORT = 8830                 # the old default collided with the live website on the deploy PC
+DEFAULT_KEEP_DAYS = 90              # the website's retention; memories older than this are dropped
+TOKEN_HEADER = "X-Smart-Glasses-Token"
+
+
+def new_token() -> str:
+    return secrets.token_urlsafe(24)               # 32 characters
 
 
 class BadMessage(ValueError):
@@ -85,22 +103,53 @@ def handle(message, store: MemoryStore, describe, log=None) -> dict:
     raise BadMessage("send either image_base64 with a timestamp, or a question")
 
 
-def make_handler(store: MemoryStore, describe, log=None):
+def make_handler(store: MemoryStore, describe, log=None, token: str = "", allowed_origins=()):
+    if not token:
+        raise ValueError("the server needs a token")
+    allowed = frozenset(allowed_origins)
+    expected = token.encode("utf-8")
+
     class Handler(BaseHTTPRequestHandler):
+        def _origin_allowed(self) -> bool:
+            origin = self.headers.get("Origin")
+            return origin is None or origin in allowed
+
+        def _cors(self) -> None:
+            origin = self.headers.get("Origin")
+            if origin is not None and origin in allowed:      # echo an allowed origin; never "*"
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+
+        def _refuse(self, status: int, error: str) -> None:
+            """Refuse a POST, reading its body first (bounded) so the client is not cut off mid-send."""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if 0 < length <= MAX_BODY:
+                self.rfile.read(length)
+            else:
+                self.close_connection = True
+            self._send(status, {"error": error})
+
         def _send(self, status: int, body: dict) -> None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Access-Control-Allow-Origin", "*")    # the front-end page may be opened from a file
+            self._cors()
             self.end_headers()
             self.wfile.write(data)
 
         def do_OPTIONS(self):
+            if self.headers.get("Origin") is None or not self._origin_allowed():
+                self._send(403, {"error": "this origin is not allowed; start the server with --allow-origin"})
+                return
             self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self._cors()
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Headers", f"Content-Type, {TOKEN_HEADER}")
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
         def do_GET(self):
@@ -112,6 +161,13 @@ def make_handler(store: MemoryStore, describe, log=None):
         def do_POST(self):
             if self.path != "/message":
                 self._send(404, {"error": "not found"})
+                return
+            if not self._origin_allowed():
+                self._refuse(403, "this origin is not allowed; start the server with --allow-origin")
+                return
+            sent = (self.headers.get(TOKEN_HEADER) or "").encode("utf-8")
+            if not hmac.compare_digest(sent, expected):
+                self._refuse(401, f"missing or wrong token: send it in the {TOKEN_HEADER} header")
                 return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -134,14 +190,23 @@ def make_handler(store: MemoryStore, describe, log=None):
     return Handler
 
 
-def make_server(host: str, port: int, data_dir: Path, describe, log=None) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(MemoryStore(data_dir), describe, log))
+def make_server(host: str, port: int, data_dir: Path, describe, log=None, *, token: str,
+                allowed_origins=(), keep_days: int | None = DEFAULT_KEEP_DAYS) -> ThreadingHTTPServer:
+    handler = make_handler(MemoryStore(data_dir, keep_days=keep_days), describe, log, token, allowed_origins)
+    return ThreadingHTTPServer((host, port), handler)
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Smart Glasses back end")
     parser.add_argument("--host", default="127.0.0.1", help="127.0.0.1 = this PC only; 0.0.0.0 = phones on your wifi too")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="pick a port nothing else on the PC uses")
+    parser.add_argument("--token", default=os.environ.get("SMART_GLASSES_TOKEN"),
+                        help="the shared token senders must present (default: SMART_GLASSES_TOKEN, else a random one)")
+    parser.add_argument("--allow-origin", action="append", default=[], metavar="ORIGIN",
+                        help="a web page origin allowed to call (repeatable), e.g. http://localhost:9000; "
+                             "'null' allows the page opened from a file")
+    parser.add_argument("--keep-days", type=int, default=DEFAULT_KEEP_DAYS,
+                        help="drop memories older than this many days (0 = keep for ever)")
     parser.add_argument("--data", type=Path, default=Path("data"), help="where the memories (words only) are kept")
     parser.add_argument("--describer", choices=("fake", "ollama"), default="fake")
     parser.add_argument("--model", help="the Ollama vision model, required with --describer ollama")
@@ -153,9 +218,13 @@ def main(argv=None) -> int:
         describe = OllamaDescriber(args.model, args.ollama_url)
     else:
         describe = FakeDescriber()
-    server = make_server(args.host, args.port, args.data, describe, log=lambda line: print(line, flush=True))
+    token = args.token or new_token()
+    server = make_server(args.host, args.port, args.data, describe, log=lambda line: print(line, flush=True),
+                         token=token, allowed_origins=args.allow_origin, keep_days=args.keep_days or None)
     print(f"Smart Glasses back end on http://{args.host}:{server.server_address[1]}  describer={args.describer}"
           f"{' model=' + args.model if args.model else ''}  memories in {args.data.resolve()}", flush=True)
+    print(f"token: {token}   (senders need it; allowed web origins: {', '.join(args.allow_origin) or 'none'})",
+          flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

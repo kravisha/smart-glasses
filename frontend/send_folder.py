@@ -1,8 +1,10 @@
 """The Smart Glasses front end, command-line version: play a folder of pictures into the back end as if they
 came off the glasses, one per second, then ask a question.
 
-    python -m frontend.send_folder --folder demo/pictures --user krish
-    python -m frontend.send_folder --user krish --ask "Where are my keys?"
+    python -m frontend.send_folder --folder demo/pictures --user krish --token <token the server printed>
+    python -m frontend.send_folder --user krish --token <token> --ask "Where are my keys?"
+
+The token can also come from SMART_GLASSES_TOKEN.
 
 Each picture is sent with the user's ID and a timestamp (the moment it is sent, like a live capture).
 Pictures are shrunk to low resolution first when Pillow is installed (pip install pillow); without it they
@@ -14,6 +16,7 @@ import argparse
 import base64
 import io
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -21,6 +24,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+DEFAULT_SERVER = "http://127.0.0.1:8830"
+TOKEN_HEADER = "X-Smart-Glasses-Token"
 PICTURE_TYPES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".fake"}
 
 
@@ -45,9 +50,9 @@ def shrink(data: bytes, max_side: int) -> bytes:
         return data
 
 
-def post(server: str, message: dict, timeout: float = 120.0) -> dict:
+def post(server: str, message: dict, token: str = "", timeout: float = 120.0) -> dict:
     request = urllib.request.Request(server.rstrip("/") + "/message", data=json.dumps(message).encode("utf-8"),
-                                     headers={"Content-Type": "application/json"}, method="POST")
+                                     headers={"Content-Type": "application/json", TOKEN_HEADER: token}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as reply:
             return json.loads(reply.read().decode("utf-8"))
@@ -55,7 +60,7 @@ def post(server: str, message: dict, timeout: float = 120.0) -> dict:
         return {"error": f"HTTP {error.code}: {error.read().decode('utf-8', errors='replace')}"}
 
 
-def send_folder(folder: Path, user_id: str, server: str, delay: float = 1.0, max_side: int = 320,
+def send_folder(folder: Path, user_id: str, server: str, token: str = "", delay: float = 1.0, max_side: int = 320,
                 sleep=time.sleep, now=lambda: datetime.now(timezone.utc), out=print) -> list[dict]:
     replies = []
     files = pictures_in(folder)
@@ -64,7 +69,7 @@ def send_folder(folder: Path, user_id: str, server: str, delay: float = 1.0, max
             sleep(delay)                                # one frame a second, the glasses' own pace
         image = shrink(path.read_bytes(), max_side)
         reply = post(server, {"user_id": user_id, "timestamp": now().isoformat(timespec="seconds"),
-                              "image_base64": base64.b64encode(image).decode("ascii")})
+                              "image_base64": base64.b64encode(image).decode("ascii")}, token)
         out(f"{index + 1}/{len(files)} {path.name}: {'ok' if reply.get('ack') else reply.get('error', reply)}")
         replies.append(reply)
     return replies
@@ -72,7 +77,9 @@ def send_folder(folder: Path, user_id: str, server: str, delay: float = 1.0, max
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Smart Glasses front end (command line)")
-    parser.add_argument("--server", default="http://127.0.0.1:8765")
+    parser.add_argument("--server", default=DEFAULT_SERVER)
+    parser.add_argument("--token", default=os.environ.get("SMART_GLASSES_TOKEN", ""),
+                        help="the token the server printed at start-up (or SMART_GLASSES_TOKEN)")
     parser.add_argument("--user", required=True, help="your user ID")
     parser.add_argument("--folder", type=Path, help="a folder of pictures to send, one per second")
     parser.add_argument("--delay", type=float, default=1.0, help="seconds between pictures")
@@ -82,11 +89,11 @@ def main(argv=None) -> int:
     if not args.folder and not args.ask:
         parser.error("give --folder, --ask, or both")
     if args.folder:
-        replies = send_folder(args.folder, args.user, args.server, args.delay, args.max_side)
+        replies = send_folder(args.folder, args.user, args.server, args.token, args.delay, args.max_side)
         failed = sum(1 for r in replies if not r.get("ack"))
         print(f"sent {len(replies)} pictures, {failed} failed")
     if args.ask:
-        reply = post(args.server, {"user_id": args.user, "question": args.ask})
+        reply = post(args.server, {"user_id": args.user, "question": args.ask}, args.token)
         print(reply.get("answer") or reply.get("error"))
     return 0
 

@@ -27,8 +27,13 @@ shrink real photos; the browser page shrinks them itself.
 ```
 py -m demo.make_fake_pictures demo/fake_walk
 py -m backend.server
-py -m frontend.send_folder --folder demo/fake_walk --user krish --ask "Where are my keys?"
+py -m frontend.send_folder --folder demo/fake_walk --user krish --token <token> --ask "Where are my keys?"
 ```
+
+The server prints a token when it starts; senders must present it. To keep the same token across restarts,
+set `SMART_GLASSES_TOKEN` (both the server and `send_folder` read it) or pass `--token`.
+The default port is 8830; if anything else on the PC uses it, pick a free one with `--port` (and `--server` /
+the page's Back end box to match).
 
 The last line should end with something like
 `Last seen at ...: Bedroom. Keys on the bedside table next to a lamp and a glass of water.`
@@ -37,13 +42,24 @@ The last line should end with something like
 
 1. Pull a small vision model in Ollama (any vision model works; check with `ollama list`):
    `ollama pull <vision model>`
-2. Start the back end with it:
-   `py -m backend.server --describer ollama --model <vision model>`
+2. Start the back end with it, allowing the page opened from a file:
+   `py -m backend.server --describer ollama --model <vision model> --allow-origin null`
 3. Walk around the house taking about 60 pictures with your phone, and copy them into a folder on the PC.
-4. Open `frontend/index.html` in a browser, pick that folder, press **Send**, then ask *Where are my keys?*
+4. Open `frontend/index.html` in a browser, paste the token the server printed, pick that folder,
+   press **Send**, then ask *Where are my keys?*
 
 To let a phone on the same wifi reach the back end, add `--host 0.0.0.0` and use the PC's address
-(for example `http://192.168.1.20:8765`) in the page. Only do that on your home network: the service has no login yet.
+(for example `http://192.168.1.20:8830`) in the page. Only do that on your home network.
+
+## Who can reach it
+
+- Every message needs the token (header `X-Smart-Glasses-Token`); without it the answer is 401.
+- A request from a web page is refused (403) unless its origin was named with `--allow-origin`. A page opened
+  from a file has origin `null`, so `--allow-origin null` is needed for `frontend/index.html`; served from a
+  local web server instead, name that origin (e.g. `--allow-origin http://localhost:9000`).
+- The service never answers with `Access-Control-Allow-Origin: *`, so other sites open in your browser cannot
+  read or write your memories.
+- Memories older than 90 days are dropped (`--keep-days`, 0 keeps them for ever).
 
 ## Speed
 
@@ -58,7 +74,7 @@ whether a model keeps up. For the demo it does not have to: the folder simply ta
 py -m unittest discover -s tests -t . -v
 ```
 
-15 tests, including the whole demo end to end: 60 pictures through the real sender into the real server,
+33 tests, including the whole demo end to end: 60 pictures through the real sender into the real server,
 one second apart, then "Where are my keys?". Each key promise was also broken on purpose to confirm a test
 catches it: a picture saved to disk, one user seeing another's memories, a failed description stored anyway,
 and eight more (11 of 11 caught).
@@ -66,5 +82,5 @@ and eight more (11 of 11 caught).
 ## Not done yet
 
 - The real vision model has not been run against this code; it needs the GPU on your PC (`--describer ollama`).
-- No login: the user ID is trusted as sent. Fine for a home demo, not for anything public.
+- No per-user login: anyone with the token can use any user ID. Fine for a home demo, not for anything public.
 - The browser page has been syntax-checked, not clicked through in a browser.

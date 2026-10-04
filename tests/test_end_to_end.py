@@ -23,19 +23,25 @@ class EndToEnd(unittest.TestCase):
     def test_sixty_pictures_in_then_where_are_my_keys(self):
         sleeps = []
         clock = iter(datetime(2026, 10, 4, 17, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=i) for i in range(1000))
-        replies = send_folder(self.folder, "krish", self.s.url, delay=1.0, sleep=sleeps.append, now=lambda: next(clock), out=lambda _l: None)
+        replies = send_folder(self.folder, "krish", self.s.url, token=self.s.TOKEN, delay=1.0, sleep=sleeps.append, now=lambda: next(clock), out=lambda _l: None)
 
         self.assertEqual(len(replies), 60)
         self.assertTrue(all(r.get("ack") for r in replies), [r for r in replies if not r.get("ack")])
         self.assertEqual(sleeps, [1.0] * 59, "one second between pictures, none before the first")
 
-        reply = post(self.s.url, {"user_id": "krish", "question": "Where are my keys?"})
+        reply = post(self.s.url, {"user_id": "krish", "question": "Where are my keys?"}, token=self.s.TOKEN)
         self.assertIn("bedside table", reply["answer"])              # the most recent sighting, frame 47
         self.assertIn("2026-10-04T17:00:47+00:00", reply["answer"])
         self.assertIn("kitchen", reply["matches"][1]["description"].lower())   # the earlier sighting is still there
 
         stored = [p for p in self.s.data.rglob("*") if p.is_file()]
         self.assertEqual([p.name for p in stored], ["krish.jsonl"], "only words were kept")
+
+    def test_the_sender_without_the_token_is_refused_and_nothing_is_stored(self):
+        replies = send_folder(self.folder, "krish", self.s.url, token="", delay=0, sleep=lambda _s: None,
+                              out=lambda _l: None)
+        self.assertTrue(all("HTTP 401" in r.get("error", "") for r in replies), replies[:2])
+        self.assertEqual([p for p in self.s.data.rglob("*") if p.is_file()], [])
 
     def test_the_sender_only_picks_up_pictures(self):
         (self.folder / "notes.txt").write_text("not a picture", encoding="utf-8")

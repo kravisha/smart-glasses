@@ -24,27 +24,192 @@ def b64(data: bytes) -> str:
 class RunningServer:
     """The real HTTP server on a free port, in a thread, with its data in a temporary folder."""
 
-    def __init__(self, describe=None):
+    TOKEN = "test-token-123"
+
+    def __init__(self, describe=None, allowed_origins=(), keep_days=None):
         self.tmp = tempfile.TemporaryDirectory()
         self.data = Path(self.tmp.name)
-        self.server = S.make_server("127.0.0.1", 0, self.data, describe or FakeDescriber())
+        self.server = S.make_server("127.0.0.1", 0, self.data, describe or FakeDescriber(), token=self.TOKEN,
+                                    allowed_origins=allowed_origins, keep_days=keep_days)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
     def post(self, message, raw: bytes | None = None):
-        data = raw if raw is not None else json.dumps(message).encode("utf-8")
-        request = urllib.request.Request(self.url + "/message", data=data, headers={"Content-Type": "application/json"}, method="POST")
+        status, _headers, body = self.request("POST", "/message", message, raw,
+                                              {"Content-Type": "application/json", S.TOKEN_HEADER: self.TOKEN})
+        return status, body
+
+    def request(self, method, path, message=None, raw: bytes | None = None, headers=None):
+        """Any request with exactly the headers given; returns (status, headers, parsed JSON body or None)."""
+        data = raw if raw is not None else (json.dumps(message).encode("utf-8") if message is not None else None)
+        request = urllib.request.Request(self.url + path, data=data, headers=headers or {}, method=method)
         try:
             with urllib.request.urlopen(request, timeout=10) as reply:
-                return reply.status, json.loads(reply.read())
+                status, got, body = reply.status, reply.headers, reply.read()
         except urllib.error.HTTPError as error:
-            return error.code, json.loads(error.read())
+            status, got, body = error.code, error.headers, error.read()
+        return status, got, (json.loads(body) if body else None)
 
     def close(self):
         self.server.shutdown()
         self.server.server_close()
         self.tmp.cleanup()
+
+
+class AccessTests(unittest.TestCase):
+    """Deploy's review of 93d68ffe, finding 1: any web page could read and write the memories (ACAO *)."""
+
+    QUESTION = {"user_id": "krish", "question": "Where are my keys?"}
+
+    def server(self, **kwargs):
+        s = RunningServer(**kwargs)
+        self.addCleanup(s.close)
+        return s
+
+    def test_a_message_without_the_token_is_refused_and_stores_nothing(self):
+        s = self.server()
+        picture = {"user_id": "krish", "timestamp": "2026-10-04T13:00:00Z", "image_base64": b64(b"FAKE:Kitchen. Keys.")}
+        status, _h, body = s.request("POST", "/message", picture, headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 401)
+        self.assertIn("token", body["error"])
+        self.assertEqual(list((s.data / "memories").iterdir()), [])
+
+    def test_a_wrong_token_is_refused(self):
+        s = self.server()
+        status, _h, _b = s.request("POST", "/message", self.QUESTION,
+                                   headers={"Content-Type": "application/json", S.TOKEN_HEADER: "test-token-124"})
+        self.assertEqual(status, 401)
+
+    def test_the_review_attack_a_foreign_page_with_text_plain_gets_nothing(self):
+        # Deploy's exact request: Origin evil.example, text/plain (no preflight). Was 200 with ACAO *.
+        s = self.server()
+        status, headers, body = s.request("POST", "/message", self.QUESTION,
+                                          headers={"Content-Type": "text/plain", "Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertNotIn("answer", body)
+        self.assertIsNone(headers.get("Access-Control-Allow-Origin"))
+
+    def test_a_foreign_origin_is_refused_even_with_the_token(self):
+        s = self.server(allowed_origins=("http://localhost:9000",))
+        status, headers, _b = s.request("POST", "/message", self.QUESTION, headers={
+            "Content-Type": "application/json", "Origin": "https://evil.example", S.TOKEN_HEADER: s.TOKEN})
+        self.assertEqual(status, 403)
+        self.assertIsNone(headers.get("Access-Control-Allow-Origin"))
+
+    def test_no_response_ever_carries_the_wildcard(self):
+        s = self.server(allowed_origins=("null",))
+        for method, path, headers in (("GET", "/health", {}), ("GET", "/nowhere", {}),
+                                      ("OPTIONS", "/message", {"Origin": "null"}),
+                                      ("OPTIONS", "/message", {"Origin": "https://evil.example"})):
+            _status, got, _b = s.request(method, path, headers=headers)
+            self.assertNotEqual(got.get("Access-Control-Allow-Origin"), "*", (method, path, headers))
+        _status, got, _b = s.request("POST", "/message", self.QUESTION, headers={
+            "Content-Type": "application/json", "Origin": "null", S.TOKEN_HEADER: s.TOKEN})
+        self.assertNotEqual(got.get("Access-Control-Allow-Origin"), "*")
+
+    def test_a_preflight_from_a_foreign_origin_is_refused(self):
+        s = self.server(allowed_origins=("http://localhost:9000",))
+        status, headers, _b = s.request("OPTIONS", "/message", headers={
+            "Origin": "https://evil.example", "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type, " + S.TOKEN_HEADER.lower()})
+        self.assertEqual(status, 403)
+        self.assertIsNone(headers.get("Access-Control-Allow-Origin"))
+
+    def test_the_allowed_page_origin_passes_preflight_and_is_answered(self):
+        s = self.server(allowed_origins=("http://localhost:9000",))
+        status, headers, _b = s.request("OPTIONS", "/message", headers={
+            "Origin": "http://localhost:9000", "Access-Control-Request-Method": "POST"})
+        self.assertEqual(status, 204)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"), "http://localhost:9000")
+        self.assertIn(S.TOKEN_HEADER, headers.get("Access-Control-Allow-Headers"))
+        status, headers, body = s.request("POST", "/message", self.QUESTION, headers={
+            "Content-Type": "application/json", "Origin": "http://localhost:9000", S.TOKEN_HEADER: s.TOKEN})
+        self.assertEqual(status, 200)
+        self.assertIn("answer", body)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"), "http://localhost:9000")
+
+    def test_a_page_opened_from_a_file_needs_the_explicit_null_flag(self):
+        # A file:// page sends "Origin: null". Refused by default, allowed only when "null" is listed.
+        headers = {"Content-Type": "application/json", "Origin": "null", S.TOKEN_HEADER: RunningServer.TOKEN}
+        status, _h, _b = self.server().request("POST", "/message", self.QUESTION, headers=headers)
+        self.assertEqual(status, 403)
+        status, got, _b = self.server(allowed_origins=("null",)).request("POST", "/message", self.QUESTION, headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(got.get("Access-Control-Allow-Origin"), "null")
+
+    def test_the_command_line_sender_sends_no_origin_and_gets_in_with_the_token(self):
+        s = self.server()
+        status, headers, body = s.request("POST", "/message", self.QUESTION,
+                                          headers={"Content-Type": "application/json", S.TOKEN_HEADER: s.TOKEN})
+        self.assertEqual(status, 200)
+        self.assertIsNone(headers.get("Access-Control-Allow-Origin"))
+
+    def test_health_needs_no_token_and_says_nothing_about_users(self):
+        status, _h, body = self.server().request("GET", "/health")
+        self.assertEqual((status, body), (200, {"ok": True}))
+
+    def test_without_a_token_flag_the_server_makes_a_long_random_one(self):
+        a, b = S.new_token(), S.new_token()
+        self.assertNotEqual(a, b)
+        self.assertGreaterEqual(len(a), 32)
+        with self.assertRaises(ValueError):
+            S.make_server("127.0.0.1", 0, Path(tempfile.mkdtemp()), FakeDescriber(), token="")
+
+
+class DefaultsTests(unittest.TestCase):
+    """Deploy's finding 2: 8765 is the live website's port on the deploy PC."""
+
+    def test_the_default_port_is_8830_everywhere(self):
+        from frontend import send_folder
+        self.assertEqual(S.DEFAULT_PORT, 8830)
+        root = Path(__file__).resolve().parent.parent
+        for name in ("backend/server.py", "frontend/send_folder.py", "frontend/index.html", "README.md"):
+            text = (root / name).read_text(encoding="utf-8")
+            self.assertNotIn("8765", text, name)
+        self.assertIn("127.0.0.1:8830", (root / "frontend/index.html").read_text(encoding="utf-8"))
+        self.assertTrue(send_folder.DEFAULT_SERVER.endswith(":8830"))
+
+    def test_the_page_sends_the_token_header_from_its_token_box(self):
+        page = (Path(__file__).resolve().parent.parent / "frontend/index.html").read_text(encoding="utf-8")
+        self.assertIn(f'"{S.TOKEN_HEADER}": $("token").value', page)
+        self.assertIn('<input id="token"', page)
+
+    def test_the_prompt_tells_the_model_not_to_describe_people(self):
+        # Finding 5b. Only the real model can show it obeys; this pins that it is asked.
+        from backend.describers import PROMPT
+        self.assertIn("Do not describe what people look like.", PROMPT)
+
+
+class RetentionTests(unittest.TestCase):
+    """Deploy's finding 5a: memories grew without limit."""
+
+    def test_the_default_keep_is_90_days_like_the_website(self):
+        self.assertEqual(S.DEFAULT_KEEP_DAYS, 90)
+
+    def test_memories_older_than_the_keep_are_dropped_from_disk_when_the_next_one_arrives(self):
+        from datetime import datetime, timedelta, timezone
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        now = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
+        store = MemoryStore(Path(tmp.name), keep_days=90, now=lambda: now)
+        path = store.root / "krish.jsonl"
+        rows = [{"timestamp": "x", "description": d, "received_at": (now - timedelta(days=age)).isoformat()}
+                for d, age in (("old", 91), ("edge", 89), ("new", 1))]
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        store.add("krish", "2026-10-04T12:00:00Z", "today")
+        self.assertEqual([r["description"] for r in store.all("krish")], ["edge", "new", "today"])
+        self.assertNotIn("old", path.read_text(encoding="utf-8"))
+
+    def test_keep_none_keeps_everything(self):
+        from datetime import datetime, timedelta, timezone
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        now = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
+        store = MemoryStore(Path(tmp.name), keep_days=None, now=lambda: now)
+        (store.root / "krish.jsonl").write_text(json.dumps(
+            {"timestamp": "x", "description": "ancient", "received_at": (now - timedelta(days=4000)).isoformat()}) + "\n",
+            encoding="utf-8")
+        store.add("krish", "2026-10-04T12:00:00Z", "today")
+        self.assertEqual([r["description"] for r in store.all("krish")], ["ancient", "today"])
 
 
 class ServerTests(unittest.TestCase):
