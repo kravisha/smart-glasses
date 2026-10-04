@@ -39,7 +39,8 @@
     <h2>Who and where</h2>
     <div class="row">
       <div><label for="user">Your user ID</label><input id="user" type="text" value="krish" autocomplete="off"></div>
-      <div><label for="server">Back end</label><input id="server" type="text" value="http://127.0.0.1:8765" autocomplete="off"></div>
+      <div><label for="server">Back end</label><input id="server" type="text" value="http://127.0.0.1:8830" autocomplete="off"></div>
+      <div><label for="token">Token (the back end prints it)</label><input id="token" type="password" value="" autocomplete="off"></div>
     </div>
   </section>
 
@@ -91,7 +92,8 @@ async function shrink(file) {
 
 async function post(message) {
   const reply = await fetch($("server").value.replace(/\/$/, "") + "/message", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(message),
+    method: "POST", body: JSON.stringify(message),
+    headers: { "Content-Type": "application/json", "X-Smart-Glasses-Token": $("token").value.trim() },
   });
   const body = await reply.json().catch(() => ({ error: `HTTP ${reply.status}` }));
   if (!reply.ok && !body.error) body.error = `HTTP ${reply.status}`;
